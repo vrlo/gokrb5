@@ -86,8 +86,17 @@ func NewSecurityLayerSession(key types.EncryptionKey, layer SecurityLayer, isIni
 // Wrap wraps a message according to the negotiated security layer.
 // For SecurityLayerNone, it returns the message unchanged.
 // For SecurityLayerIntegrity, it adds a checksum.
-// For SecurityLayerConfidentiality, it encrypts and adds a checksum.
+// For SecurityLayerConfidentiality, it encrypts and adds integrity protection.
 // The returned bytes include the GSS-API WrapToken format (RFC 4121).
+//
+// Encryption Model (two layers):
+// 1. GSS-API layer (RFC 4121): Creates (message | filler | embedded-header)
+// 2. Kerberos crypto layer (RFC 3961): Adds (confounder | data | padding)
+//
+// Final encrypted structure: Encrypt(confounder | message | filler | embedded-header) | HMAC
+//
+// The filler bytes ensure no padding is added after the embedded header, satisfying
+// RFC 4121 section 4.2.4: "there SHALL be no crypto-system residue present after decryption."
 func (s *SecurityLayerSession) Wrap(message []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,26 +119,28 @@ func (s *SecurityLayerSession) Wrap(message []byte) ([]byte, error) {
 		flags |= 0x02 // Set sealed (encrypted) flag
 	}
 
-	// Build the header that will be used for encryption or checksum
-	// For now, RRC is 0 in the embedded header (will be set in outer header if needed)
-	headerForCrypto := make([]byte, 16)
-	copy(headerForCrypto[0:2], []byte{0x05, 0x04})
-	headerForCrypto[2] = flags
-	headerForCrypto[3] = 0xFF
-	// EC and RRC are 0 in the embedded header
-	binary.BigEndian.PutUint64(headerForCrypto[8:16], s.sendSeqNum)
-
-	var payload []byte
-	var ec uint16
+	// Create wrap token early with flags and sequence number
+	// EC and Payload will be set after determining encryption/integrity details
+	token := &WrapToken{
+		Flags:     flags,
+		EC:        0, // Set after determining payload
+		RRC:       0,
+		SndSeqNum: s.sendSeqNum,
+	}
 
 	if s.layer == SecurityLayerConfidentiality {
 		debugLog("WRAP: Creating confidentiality token")
-		// RFC 4121 4.2.4: Encrypt(plaintext | filler | header)
-		// For now, use 0 filler bytes
-		fillerSize := 0
+		// RFC 4121 section 4.2.4: Encrypt(plaintext | filler | embedded-header)
+		// Build the embedded header with EC=0 and RRC=0
+		headerForCrypto := token.GetEmbeddedHeader()
+
+		// Calculate filler size to eliminate crypto-system residue per RFC 4121 section 4.2.4.
+		// This prevents RFC 3961's EncryptMessage from adding zero-padding after the embedded header.
+		fillerSize := s.calculateFillerSize(len(message))
 		toEncrypt := make([]byte, len(message)+fillerSize+16)
 		copy(toEncrypt, message)
-		// filler would go here (all zeros if needed)
+		// Filler bytes (if any) are already zero-initialized in the slice
+		// They go between the message and the embedded header
 		copy(toEncrypt[len(message)+fillerSize:], headerForCrypto)
 
 		debugLog("WRAP: Encrypting %d bytes (message=%d + filler=%d + header=16)",
@@ -141,24 +152,15 @@ func (s *SecurityLayerSession) Wrap(message []byte) ([]byte, error) {
 			debugLog("WRAP: Encryption FAILED: %v", err)
 			return nil, fmt.Errorf("failed to encrypt payload: %w", err)
 		}
-		payload = encryptedPayload
-		ec = uint16(fillerSize) // EC = filler size for confidentiality tokens
-		debugLog("WRAP: Encrypted payload length=%d, EC=%d (filler size)", len(payload), ec)
+		token.Payload = encryptedPayload
+		token.EC = uint16(fillerSize) // EC = filler size for confidentiality tokens
+		debugLog("WRAP: Encrypted payload length=%d, EC=%d (filler size)", len(token.Payload), token.EC)
 	} else {
 		debugLog("WRAP: Creating integrity token")
 		// For integrity-only, payload is plaintext
-		payload = message
-		ec = uint16(s.encType.GetHMACBitLength() / 8) // EC = checksum size for integrity tokens
-		debugLog("WRAP: Using plaintext payload, EC=%d (checksum size)", ec)
-	}
-
-	// Create wrap token with proper EC value
-	token := &WrapToken{
-		Flags:     flags,
-		EC:        ec,
-		RRC:       0,
-		SndSeqNum: s.sendSeqNum,
-		Payload:   payload,
+		token.Payload = message
+		token.EC = uint16(s.encType.GetHMACBitLength() / 8) // EC = checksum size for integrity tokens
+		debugLog("WRAP: Using plaintext payload, EC=%d (checksum size)", token.EC)
 	}
 
 	debugLog("WRAP: Token created - Flags=%#02x, EC=%d, RRC=%d, SeqNum=%d, PayloadLen=%d",
@@ -198,8 +200,17 @@ func (s *SecurityLayerSession) Wrap(message []byte) ([]byte, error) {
 
 // Unwrap unwraps a GSS-API wrapped message.
 // For SecurityLayerNone, it returns the message unchanged.
-// For SecurityLayerIntegrity and SecurityLayerConfidentiality, it verifies the checksum
+// For SecurityLayerIntegrity and SecurityLayerConfidentiality, it verifies integrity
 // and decrypts if necessary.
+//
+// Decryption process (two layers):
+// 1. Kerberos crypto layer (RFC 3961): DecryptMessage removes confounder
+//    Returns: message | filler | embedded-header (with no padding due to filler)
+// 2. GSS-API layer (RFC 4121): Strips EC (filler size) + 16 (header) bytes
+//    Returns: clean message
+//
+// The EC field in confidentiality tokens indicates the filler size, allowing us to
+// extract the original message without any crypto-system residue.
 func (s *SecurityLayerSession) Unwrap(wrappedMessage []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -352,6 +363,63 @@ func (s *SecurityLayerSession) getKeyUsage(sending bool) uint32 {
 		return keyusage.GSSAPI_ACCEPTOR_SEAL
 	}
 	return keyusage.GSSAPI_INITIATOR_SEAL
+}
+
+// calculateFillerSize computes the number of filler bytes needed per RFC 4121 section 4.2.4
+// to eliminate crypto-system residue after decryption.
+//
+// RFC 4121 states: "The values and size of the filler octets are chosen by implementations,
+// such that there SHALL be no crypto-system residue present after the decryption."
+//
+// The encryption happens in two layers:
+// 1. GSS-API (RFC 4121): Encrypts (message | filler | embedded-header)
+// 2. Kerberos Crypto (RFC 3961): Adds confounder and may add zero-padding
+//
+// RFC 3961's EncryptMessage adds:
+//   - Confounder at the beginning (typically 8 or 16 bytes)
+//   - Zero-padding at the end to align to cipher block size
+//
+// The zero-padding added by RFC 3961 is NOT removed during decryption, so it becomes
+// "crypto-system residue" that RFC 4121 requires us to eliminate. We do this by adding
+// filler bytes BEFORE the embedded header so that the total length is already aligned,
+// preventing RFC 3961 from adding any padding after the embedded header.
+//
+// Returns 0 for encryption types that don't need filler (AES-CTS, RC4).
+func (s *SecurityLayerSession) calculateFillerSize(messageLen int) int {
+	// Get the cipher block size in bytes
+	blockSize := s.encType.GetCypherBlockBitLength() / 8
+
+	// For stream ciphers or block size of 1, no filler needed
+	if blockSize <= 1 {
+		return 0
+	}
+
+	// For CTS (Ciphertext Stealing) modes, indicated by GetMessageBlockByteSize() == 1,
+	// no filler is needed as CTS handles arbitrary lengths without padding
+	if s.encType.GetMessageBlockByteSize() == 1 {
+		return 0
+	}
+
+	// Calculate the total length that will be encrypted by RFC 3961:
+	// confounder + message + filler + embedded-header (16 bytes)
+	confounderSize := s.encType.GetConfounderByteSize()
+	embeddedHeaderSize := 16
+
+	// Current total without filler
+	totalWithoutFiller := confounderSize + messageLen + embeddedHeaderSize
+
+	// If already aligned to block size, no filler needed
+	if totalWithoutFiller%blockSize == 0 {
+		return 0
+	}
+
+	// Calculate filler to align to block size
+	fillerSize := blockSize - (totalWithoutFiller % blockSize)
+
+	debugLog("FILLER: blockSize=%d, confounderSize=%d, messageLen=%d, totalWithoutFiller=%d, fillerSize=%d",
+		blockSize, confounderSize, messageLen, totalWithoutFiller, fillerSize)
+
+	return fillerSize
 }
 
 // WrapWithSASLFraming wraps a message and prepends the 4-byte SASL length header.

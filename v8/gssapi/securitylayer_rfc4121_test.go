@@ -1,6 +1,7 @@
 package gssapi
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"testing"
@@ -449,4 +450,174 @@ func TestRFC4121_NoChecksumForConfidentiality(t *testing.T) {
 	// where encrypted_size = len(message) + filler + 16 (embedded header) + block padding
 	minExpectedLen := 16 + len(message) + int(ec) + 16 // header + message + filler + embedded header
 	assert.GreaterOrEqual(t, len(wrapped), minExpectedLen, "Token should contain header + encrypted data")
+}
+
+// TestRFC4121_ZeroCryptoSystemResidue verifies RFC 4121 section 4.2.4 requirement:
+// "The values and size of the filler octets are chosen by implementations,
+// such that there SHALL be no crypto-system residue present after the decryption."
+//
+// This test ensures that after wrap/unwrap, the decrypted message is exactly
+// the original message with no trailing padding bytes from the crypto layer.
+func TestRFC4121_ZeroCryptoSystemResidue(t *testing.T) {
+	key := getTestKey()
+
+	// Test various message lengths that would require different alignments
+	// for block ciphers. For AES-CTS (used in getTestKey), filler should be 0.
+	// For DES3 (8-byte blocks), these lengths would require different filler amounts.
+	testCases := []struct {
+		name      string
+		length    int
+		createMsg func(int) []byte
+	}{
+		{
+			name:   "1 byte message",
+			length: 1,
+			createMsg: func(n int) []byte {
+				return []byte{0x01}
+			},
+		},
+		{
+			name:   "7 byte message (one before 8-byte boundary)",
+			length: 7,
+			createMsg: func(n int) []byte {
+				return []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+			},
+		},
+		{
+			name:   "8 byte message (exactly 8-byte boundary)",
+			length: 8,
+			createMsg: func(n int) []byte {
+				return []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+			},
+		},
+		{
+			name:   "9 byte message (one after 8-byte boundary)",
+			length: 9,
+			createMsg: func(n int) []byte {
+				return []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09}
+			},
+		},
+		{
+			name:   "15 byte message",
+			length: 15,
+			createMsg: func(n int) []byte {
+				msg := make([]byte, n)
+				for i := 0; i < n; i++ {
+					msg[i] = byte(i + 1)
+				}
+				return msg
+			},
+		},
+		{
+			name:   "16 byte message (exactly 16-byte boundary)",
+			length: 16,
+			createMsg: func(n int) []byte {
+				msg := make([]byte, n)
+				for i := 0; i < n; i++ {
+					msg[i] = byte(i + 1)
+				}
+				return msg
+			},
+		},
+		{
+			name:   "17 byte message",
+			length: 17,
+			createMsg: func(n int) []byte {
+				msg := make([]byte, n)
+				for i := 0; i < n; i++ {
+					msg[i] = byte(i + 1)
+				}
+				return msg
+			},
+		},
+		{
+			name:   "23 byte message",
+			length: 23,
+			createMsg: func(n int) []byte {
+				msg := make([]byte, n)
+				for i := 0; i < n; i++ {
+					msg[i] = byte(i + 1)
+				}
+				return msg
+			},
+		},
+		{
+			name:   "24 byte message (3 * 8-byte blocks)",
+			length: 24,
+			createMsg: func(n int) []byte {
+				msg := make([]byte, n)
+				for i := 0; i < n; i++ {
+					msg[i] = byte(i + 1)
+				}
+				return msg
+			},
+		},
+		{
+			name:   "25 byte message",
+			length: 25,
+			createMsg: func(n int) []byte {
+				msg := make([]byte, n)
+				for i := 0; i < n; i++ {
+					msg[i] = byte(i + 1)
+				}
+				return msg
+			},
+		},
+		{
+			name:   "Message ending with legitimate zero bytes",
+			length: 10,
+			createMsg: func(n int) []byte {
+				// Create a message that ends with zeros
+				// This tests that we don't mistake legitimate zeros for padding
+				return []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create sessions for wrap/unwrap
+			clientSession, err := NewSecurityLayerSession(key, SecurityLayerConfidentiality, true, 0)
+			require.NoError(t, err)
+
+			serverSession, err := NewSecurityLayerSession(key, SecurityLayerConfidentiality, false, 0)
+			require.NoError(t, err)
+
+			// Create original message
+			original := tc.createMsg(tc.length)
+			require.Equal(t, tc.length, len(original), "test setup: message length should match")
+
+			// Wrap the message
+			wrapped, err := clientSession.Wrap(original)
+			require.NoError(t, err)
+
+			// Unwrap the message
+			unwrapped, err := serverSession.Unwrap(wrapped)
+			require.NoError(t, err)
+
+			// CRITICAL ASSERTIONS for zero residue:
+			// 1. Length must be exactly the same (no trailing padding)
+			assert.Equal(t, len(original), len(unwrapped),
+				"Unwrapped message length must equal original length (no crypto-system residue)")
+
+			// 2. Content must be byte-for-byte identical (no corruption, no padding)
+			assert.True(t, bytes.Equal(original, unwrapped),
+				"Unwrapped message must be identical to original (no crypto-system residue)")
+
+			// Additional verification: if lengths match but content differs,
+			// show exactly where they differ for debugging
+			if len(original) == len(unwrapped) && !bytes.Equal(original, unwrapped) {
+				for i := 0; i < len(original); i++ {
+					if original[i] != unwrapped[i] {
+						t.Errorf("Byte mismatch at position %d: original=0x%02x, unwrapped=0x%02x",
+							i, original[i], unwrapped[i])
+					}
+				}
+			}
+
+			// Verify EC field contains the filler size (should be 0 for AES-CTS)
+			ec := binary.BigEndian.Uint16(wrapped[4:6])
+			t.Logf("Message length: %d bytes, EC (filler size): %d bytes", tc.length, ec)
+		})
+	}
 }
